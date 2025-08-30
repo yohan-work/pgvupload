@@ -14,11 +14,15 @@ load_dotenv()
 APP = FastAPI(title="RAG Upload Admin (FastAPI)")
 
 # ===== 환경설정 =====
-SUPABASE_DB_CONN = os.getenv("SUPABASE_DB_CONN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+
+# Supabase 클라이언트 초기화
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ===== 유틸 =====
 def extract_text_from_file(file_bytes: bytes, filename: str, mime: Optional[str]) -> str:
@@ -79,27 +83,53 @@ def ollama_embed(texts: List[str]) -> List[List[float]]:
 
 def upsert_to_db(title: str, filename: str, mime: Optional[str], bytes_len: int,
                  whole_text: str, chunks: List[str], embeds: List[List[float]]) -> dict:
-    with psycopg.connect(SUPABASE_DB_CONN) as conn:
-        with conn.cursor() as cur:
-            doc_hash = sha256_text(whole_text)
-            cur.execute("""
-                insert into documents (title, source_path, mime_type, bytes, hash)
-                values (%s, %s, %s, %s, %s)
-                on conflict (hash) do update set updated_at = now()
-                returning id;
-            """, (title, filename, mime, bytes_len, doc_hash))
-            document_id = cur.fetchone()[0]
-
-            cur.execute("delete from chunks where document_id = %s", (document_id,))
-            for idx, (c, e) in enumerate(zip(chunks, embeds)):
-                vec = f"[{','.join(str(x) for x in e)}]"
-                cur.execute("""
-                    insert into chunks (document_id, chunk_index, content, embedding)
-                    values (%s, %s, %s, %s::vector)
-                """, (document_id, idx, c, vec))
-            
-            conn.commit()
-            return {"document_id": str(document_id), "chunks": len(chunks)}
+    doc_hash = sha256_text(whole_text)
+    
+    # 1) documents 테이블에 upsert
+    doc_result = supabase.table("documents").upsert({
+        "title": title,
+        "source_path": filename,
+        "mime_type": mime,
+        "bytes": bytes_len,
+        "hash": doc_hash
+    }, on_conflict="hash").execute()
+    
+    if not doc_result.data:
+        raise Exception("문서 저장 실패")
+    
+    document_id = doc_result.data[0]["id"]
+    
+    # 2) 기존 chunks 삭제
+    supabase.table("chunks").delete().eq("document_id", document_id).execute()
+    
+    # 3) 새 chunks 삽입 (RPC 함수로 vector 변환)
+    chunks_data = []
+    for idx, (content, embedding) in enumerate(zip(chunks, embeds)):
+        chunks_data.append({
+            "document_id": document_id,
+            "chunk_index": idx,
+            "content": content,
+            "embedding": embedding  # List[float] 그대로 전달
+        })
+    
+    # RPC 함수로 embedding을 vector로 변환해서 삽입
+    try:
+        result = supabase.rpc("insert_chunks_with_embeddings", {
+            "chunks_data": chunks_data
+        }).execute()
+        
+        return {"document_id": str(document_id), "chunks": len(chunks)}
+        
+    except Exception as e:
+        # RPC 함수가 없는 경우, 임시로 embedding을 JSON으로 저장
+        print(f"RPC 함수 사용 실패, JSON으로 저장: {e}")
+        
+        # embedding을 JSON 문자열로 변환해서 저장 (임시)
+        for chunk_data in chunks_data:
+            chunk_data["embedding"] = str(chunk_data["embedding"])
+        
+        chunk_result = supabase.table("chunks").insert(chunks_data).execute()
+        return {"document_id": str(document_id), "chunks": len(chunks)}
 
 # ===== 뷰 (1페이지) =====
 FORM_HTML = """

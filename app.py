@@ -9,6 +9,7 @@ from supabase import create_client, Client
 
 from pypdf import PdfReader
 import docx as docx_reader
+from pptx import Presentation
 
 load_dotenv()
 
@@ -38,10 +39,25 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def extract_text_from_file(file_bytes: bytes, filename: str, mime: Optional[str]) -> str:
     name_lower = (filename or "").lower()
     mime = (mime or "").lower()
+    
+    # PDF 파일
     if name_lower.endswith(".pdf") or "pdf" in mime:
         return extract_pdf_text(file_bytes)
-    if name_lower.endswith(".docx") or "word" in mime or "officedocument" in mime:
+    
+    # PowerPoint 파일
+    if (name_lower.endswith((".ppt", ".pptx")) or 
+        "presentation" in mime or 
+        "powerpoint" in mime or
+        "presentationml" in mime):
+        return extract_pptx_text(file_bytes)
+    
+    # Word 파일
+    if (name_lower.endswith(".docx") or 
+        "wordprocessing" in mime or 
+        ("word" in mime and "presentation" not in mime)):
         return extract_docx_text(file_bytes)
+    
+    # 일반 텍스트
     try:
         return file_bytes.decode("utf-8", errors="ignore")
     except:
@@ -60,6 +76,26 @@ def extract_docx_text(file_bytes: bytes) -> str:
     with io.BytesIO(file_bytes) as buf:
         doc = docx_reader.Document(buf)
         return "\n".join(p.text for p in doc.paragraphs).strip()
+
+def extract_pptx_text(file_bytes: bytes) -> str:
+    """PowerPoint 파일에서 텍스트 추출"""
+    text = []
+    with io.BytesIO(file_bytes) as buf:
+        prs = Presentation(buf)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    shape_text = shape.text.strip()
+                    if shape_text:
+                        text.append(shape_text)
+                # 표 안의 텍스트도 추출
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                text.append(cell_text)
+    return "\n".join(text).strip()
 
 def chunk_text(text: str, size: int, overlap: int) -> List[str]:
     text = text.strip()
@@ -168,7 +204,7 @@ FORM_HTML = """
       <input type="text" name="title" placeholder="(선택) 미입력 시 파일명 사용" />
       <label>파일 선택</label>
       <input type="file" name="file" required />
-      <div class="hint">PDF / DOCX / TXT 권장</div>
+      <div class="hint">PDF / DOCX / PPTX / TXT 지원</div>
       <button type="submit">업로드 → 인덱싱 → DB 저장</button>
     </form>
     <div class="msg">업로드 후 결과가 이 페이지로 표시됩니다.</div>

@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
-import psycopg2
+from supabase import create_client, Client
 
 from pypdf import PdfReader
 import docx as docx_reader
@@ -79,30 +79,27 @@ def ollama_embed(texts: List[str]) -> List[List[float]]:
 
 def upsert_to_db(title: str, filename: str, mime: Optional[str], bytes_len: int,
                  whole_text: str, chunks: List[str], embeds: List[List[float]]) -> dict:
-    conn = psycopg2.connect(SUPABASE_DB_CONN)
-    conn.autocommit = True
-    cur = conn.cursor()
+    with psycopg.connect(SUPABASE_DB_CONN) as conn:
+        with conn.cursor() as cur:
+            doc_hash = sha256_text(whole_text)
+            cur.execute("""
+                insert into documents (title, source_path, mime_type, bytes, hash)
+                values (%s, %s, %s, %s, %s)
+                on conflict (hash) do update set updated_at = now()
+                returning id;
+            """, (title, filename, mime, bytes_len, doc_hash))
+            document_id = cur.fetchone()[0]
 
-    doc_hash = sha256_text(whole_text)
-    cur.execute("""
-        insert into documents (title, source_path, mime_type, bytes, hash)
-        values (%s, %s, %s, %s, %s)
-        on conflict (hash) do update set updated_at = now()
-        returning id;
-    """, (title, filename, mime, bytes_len, doc_hash))
-    document_id = cur.fetchone()[0]
-
-    cur.execute("delete from chunks where document_id = %s", (document_id,))
-    for idx, (c, e) in enumerate(zip(chunks, embeds)):
-        vec = f"[{','.join(str(x) for x in e)}]"
-        cur.execute("""
-            insert into chunks (document_id, chunk_index, content, embedding)
-            values (%s, %s, %s, %s::vector)
-        """, (document_id, idx, c, vec))
-
-    cur.close()
-    conn.close()
-    return {"document_id": str(document_id), "chunks": len(chunks)}
+            cur.execute("delete from chunks where document_id = %s", (document_id,))
+            for idx, (c, e) in enumerate(zip(chunks, embeds)):
+                vec = f"[{','.join(str(x) for x in e)}]"
+                cur.execute("""
+                    insert into chunks (document_id, chunk_index, content, embedding)
+                    values (%s, %s, %s, %s::vector)
+                """, (document_id, idx, c, vec))
+            
+            conn.commit()
+            return {"document_id": str(document_id), "chunks": len(chunks)}
 
 # ===== 뷰 (1페이지) =====
 FORM_HTML = """

@@ -1,8 +1,9 @@
 import os, io, hashlib, requests
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -12,6 +13,15 @@ import docx as docx_reader
 load_dotenv()
 
 APP = FastAPI(title="RAG Upload Admin (FastAPI)")
+
+# ===== CORS 설정 (Nextron 앱 연동용) =====
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Nextron 앱에서 접근 가능
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ===== 환경설정 =====
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -166,6 +176,196 @@ FORM_HTML = """
 </body>
 </html>
 """
+
+# ===== API 엔드포인트 (Nextron 앱용) =====
+
+@APP.get("/api/status")
+def api_status():
+    """서비스 상태 확인"""
+    try:
+        # Ollama 연결 테스트
+        ollama_status = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5).status_code == 200
+        
+        # Supabase 연결 테스트  
+        supabase_status = bool(supabase.table("documents").select("id").limit(1).execute())
+        
+        return JSONResponse({
+            "status": "healthy",
+            "ollama": "connected" if ollama_status else "disconnected",
+            "supabase": "connected" if supabase_status else "disconnected",
+            "embed_model": EMBED_MODEL,
+            "chunk_size": CHUNK_SIZE
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "error": str(e)
+        }, status_code=500)
+
+@APP.post("/api/upload")
+async def api_upload(file: UploadFile, title: Optional[str] = Form(default=None)):
+    """Nextron 앱에서 호출하는 JSON API"""
+    try:
+        file_bytes = await file.read()
+        mime = file.content_type or "application/octet-stream"
+        name = file.filename or "uploaded_file"
+        title = title.strip() if title else name
+
+        # 1) 텍스트 추출
+        text = extract_text_from_file(file_bytes, name, mime)
+        if not text.strip():
+            raise HTTPException(400, f"텍스트 추출 실패: {name} ({mime})")
+
+        # 2) 청크
+        chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+        if not chunks:
+            raise HTTPException(400, "청크 생성 실패(빈 텍스트)")
+
+        # 3) 임베딩 (Ollama)
+        embeds = ollama_embed(chunks)
+
+        # 4) DB 저장
+        result = upsert_to_db(
+            title=title,
+            filename=name,
+            mime=mime,
+            bytes_len=len(file_bytes),
+            whole_text=text,
+            chunks=chunks,
+            embeds=embeds
+        )
+        
+        return JSONResponse({
+            "success": True,
+            "document_id": result["document_id"],
+            "title": title,
+            "filename": name,
+            "mime": mime,
+            "bytes": len(file_bytes),
+            "chunks": result["chunks"],
+            "message": "문서 인덱싱 완료"
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"처리 오류: {str(e)}")
+
+@APP.get("/api/documents")
+def api_list_documents(limit: int = 50, offset: int = 0):
+    """업로드된 문서 목록"""
+    try:
+        result = supabase.table("documents") \
+            .select("id, title, source_path, mime_type, bytes, created_at") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .offset(offset) \
+            .execute()
+            
+        return JSONResponse({
+            "success": True,
+            "documents": result.data,
+            "count": len(result.data)
+        })
+    except Exception as e:
+        raise HTTPException(500, f"문서 목록 조회 오류: {str(e)}")
+
+@APP.post("/api/search")  
+async def api_search(request: dict):
+    """벡터 유사도 검색 (Nextron용 핵심 기능)"""
+    try:
+        query = request.get("query", "")
+        top_k = request.get("top_k", 5)
+        threshold = request.get("threshold", 0.5)
+        
+        if not query.strip():
+            raise HTTPException(400, "검색어를 입력해주세요")
+        
+        # 1) 질의 임베딩 생성
+        query_embedding = ollama_embed([query])[0]  # List[float]
+        
+        # 2) Python으로 벡터 유사도 검색
+        import json
+        import math
+        
+        # 모든 청크와 문서 정보 가져오기
+        chunks_data = supabase.table("chunks") \
+            .select("id, document_id, chunk_index, content, embedding") \
+            .execute()
+        
+        docs_data = supabase.table("documents") \
+            .select("id, title") \
+            .execute()
+        
+        # 문서 title 매핑
+        doc_titles = {doc["id"]: doc["title"] for doc in docs_data.data}
+        
+        # 유사도 계산
+        similarities = []
+        for chunk in chunks_data.data:
+            try:
+                # 문자열로 저장된 임베딩을 리스트로 변환
+                if isinstance(chunk["embedding"], str):
+                    # "[1.0, 2.0, ...]" 형태의 문자열을 파싱
+                    embedding_str = chunk["embedding"].strip()
+                    if embedding_str.startswith('[') and embedding_str.endswith(']'):
+                        chunk_embedding = json.loads(embedding_str)
+                    else:
+                        # "1.0,2.0,..." 형태면 split 사용
+                        chunk_embedding = [float(x.strip()) for x in embedding_str.split(',')]
+                else:
+                    chunk_embedding = chunk["embedding"]
+                
+                # 차원 검증
+                if len(chunk_embedding) != len(query_embedding):
+                    print(f"⚠️ 차원 불일치: query({len(query_embedding)}) vs chunk({len(chunk_embedding)})")
+                    continue
+                
+                # 코사인 유사도 계산
+                dot_product = sum(a * b for a, b in zip(query_embedding, chunk_embedding))
+                norm_query = math.sqrt(sum(a * a for a in query_embedding))
+                norm_chunk = math.sqrt(sum(a * a for a in chunk_embedding))
+                similarity = dot_product / (norm_query * norm_chunk) if (norm_query * norm_chunk) > 0 else 0
+                
+                # 모든 결과를 추가
+                similarities.append({
+                    "content": chunk["content"],
+                    "similarity": float(similarity),
+                    "document_id": chunk["document_id"],
+                    "document_title": doc_titles.get(chunk["document_id"], ""),
+                    "chunk_index": chunk["chunk_index"]
+                })
+                    
+            except Exception as calc_error:
+                print(f"청크 {chunk['id']} 유사도 계산 실패: {calc_error}")
+                continue
+        
+        # 유사도 높은 순으로 정렬
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # 임계값 필터링 및 상위 k개 선택
+        results = [s for s in similarities if s["similarity"] > threshold][:top_k]
+        
+        # 디버그 정보 출력
+        print(f"🔍 검색: '{query}' | 전체={len(similarities)} | 임계값>{threshold} | 결과={len(results)}")
+        if similarities:
+            print(f"📊 유사도: {similarities[0]['similarity']:.3f}(최고) ~ {similarities[-1]['similarity']:.3f}(최저)")
+            for i, s in enumerate(similarities[:3]):
+                print(f"  {i+1}. {s['similarity']:.3f}: {s['content'][:50]}...")
+        
+        return JSONResponse({
+            "success": True,
+            "query": query,
+            "results": results,
+            "count": len(results)
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"검색 오류: {str(e)}")
+
+# ===== 웹 페이지 (기존 유지) =====
 
 @APP.get("/", response_class=HTMLResponse)
 def index():

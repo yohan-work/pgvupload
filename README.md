@@ -109,3 +109,43 @@ def search_documents(query: str, top_k: int = 5):
 - **배치 업로드**: 여러 파일 동시 처리 가능하면 유용할듯.
 
 ---
+
+## test scenario
+
+### 문서 업로드 & 인덱싱
+
+웹 UI → Python API → Ollama 임베딩 → Supabase 저장
+
+### 검색 + RAG 질의응답(nextron)
+
+Nextron → Python API → 유사도 계산 → 결과 반환
+
+1. 서비스 상태 확인
+   const status = await fetch('http://127.0.0.1:8000/api/status')
+   → {status: "healthy", ollama: "connected", supabase: "connected"}
+
+2. 파일 업로드 (프로그래매틱)
+   const formData = new FormData()
+   formData.append('file', fileBlob)
+   const upload = await fetch('http://127.0.0.1:8000/api/upload', {
+   method: 'POST', body: formData
+   })
+   → {success: true, document_id: "uuid", chunks: 6}
+
+3. 벡터 유사도 검색
+   const search = await fetch('http://127.0.0.1:8000/api/search', {
+   method: 'POST',
+   headers: {'Content-Type': 'application/json'},
+   body: JSON.stringify({query: "Contact Point", top_k: 3})
+   })
+   → {success: true, results: [{content: "...", similarity: 0.5}]}
+
+4. 업로드된 문서 목록
+   const docs = await fetch('http://127.0.0.1:8000/api/documents')
+   → {success: true, documents: [...], count: 1}
+
+### Nextron 통합 절차:
+
+- Python 서버 실행: uvicorn app:APP --port 8000
+- Ollama 실행: ollama serve
+- Nextron에서 API 호출: 위 JavaScript 코드 사용

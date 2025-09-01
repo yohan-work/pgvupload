@@ -1,8 +1,8 @@
-import os, io, hashlib, requests
+import os, io, hashlib, requests, json, math
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -29,6 +29,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") 
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "llama3:latest")  # 채팅용 모델
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 
@@ -126,6 +127,132 @@ def ollama_embed(texts: List[str]) -> List[List[float]]:
         r.raise_for_status()
         out.append(r.json()["embedding"])
     return out
+
+def calculate_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    """코사인 유사도 계산"""
+    dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    return dot_product / (norm_a * norm_b) if (norm_a * norm_b) > 0 else 0
+
+def search_relevant_chunks(query: str, top_k: int = 3, threshold: float = 0.3) -> List[dict]:
+    """질의와 관련된 청크들을 벡터 유사도로 검색 (기존 api/search 로직 재사용)"""
+    try:
+        # 1) 질의 임베딩 생성
+        query_embedding = ollama_embed([query])[0]
+        
+        # 2) 모든 청크와 문서 정보 가져오기 (기존 로직과 동일)
+        chunks_data = supabase.table("chunks") \
+            .select("id, document_id, chunk_index, content, embedding") \
+            .execute()
+        
+        docs_data = supabase.table("documents") \
+            .select("id, title") \
+            .execute()
+        
+        # 문서 title 매핑
+        doc_titles = {doc["id"]: doc["title"] for doc in docs_data.data}
+        
+        # 3) 유사도 계산 (기존 api/search와 동일한 로직)
+        similarities = []
+        for chunk in chunks_data.data:
+            try:
+                # 문자열로 저장된 임베딩을 리스트로 변환
+                if isinstance(chunk["embedding"], str):
+                    # "[1.0, 2.0, ...]" 형태의 문자열을 파싱
+                    embedding_str = chunk["embedding"].strip()
+                    if embedding_str.startswith('[') and embedding_str.endswith(']'):
+                        chunk_embedding = json.loads(embedding_str)
+                    else:
+                        # "1.0,2.0,..." 형태면 split 사용
+                        chunk_embedding = [float(x.strip()) for x in embedding_str.split(',')]
+                else:
+                    chunk_embedding = chunk["embedding"]
+                
+                # 차원 검증
+                if len(chunk_embedding) != len(query_embedding):
+                    print(f"⚠️ 차원 불일치: query({len(query_embedding)}) vs chunk({len(chunk_embedding)})")
+                    continue
+                
+                # 코사인 유사도 계산 (기존과 동일)
+                dot_product = sum(a * b for a, b in zip(query_embedding, chunk_embedding))
+                norm_query = math.sqrt(sum(a * a for a in query_embedding))
+                norm_chunk = math.sqrt(sum(a * a for a in chunk_embedding))
+                similarity = dot_product / (norm_query * norm_chunk) if (norm_query * norm_chunk) > 0 else 0
+                
+                # 모든 결과를 similarities에 추가
+                similarities.append({
+                    "content": chunk["content"],
+                    "similarity": float(similarity),
+                    "document_id": chunk["document_id"],
+                    "document_title": doc_titles.get(chunk["document_id"], ""),
+                    "chunk_index": chunk["chunk_index"]
+                })
+                    
+            except Exception as calc_error:
+                print(f"청크 {chunk['id']} 유사도 계산 실패: {calc_error}")
+                continue
+        
+        # 4) 유사도 높은 순으로 정렬
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # 5) 임계값 필터링 및 상위 k개 선택
+        results = [s for s in similarities if s["similarity"] > threshold][:top_k]
+        
+        # 디버그 정보 출력
+        print(f"🔍 RAG 검색: '{query}' | 전체={len(similarities)} | 임계값>{threshold} | 결과={len(results)}")
+        if similarities:
+            print(f"📊 유사도: {similarities[0]['similarity']:.3f}(최고) ~ {similarities[-1]['similarity']:.3f}(최저)")
+            for i, s in enumerate(similarities[:3]):
+                print(f"  {i+1}. {s['similarity']:.3f}: {s['content'][:50]}...")
+        
+        return results
+        
+    except Exception as e:
+        print(f"검색 오류: {e}")
+        return []
+
+def create_context_from_chunks(chunks: List[dict]) -> str:
+    """검색된 청크들로부터 컨텍스트 생성"""
+    if not chunks:
+        return "관련 문서를 찾을 수 없습니다."
+    
+    context_parts = []
+    for i, chunk in enumerate(chunks):
+        context_parts.append(f"[문서 {i+1}] {chunk['document_title']}\n{chunk['content']}")
+    
+    return "\n\n---\n\n".join(context_parts)
+
+def ollama_chat_stream(prompt: str, model: str = None):
+    """Ollama chat API 스트리밍 호출"""
+    model = model or CHAT_MODEL
+    
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": True
+            },
+            stream=True,
+            timeout=300
+        )
+        response.raise_for_status()
+        
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line.decode('utf-8'))
+                    if 'response' in data:
+                        yield data['response']
+                    if data.get('done', False):
+                        break
+                except json.JSONDecodeError:
+                    continue
+                    
+    except Exception as e:
+        yield f"[오류] LLM 응답 생성 실패: {str(e)}"
 
 def upsert_to_db(title: str, filename: str, mime: Optional[str], bytes_len: int,
                  whole_text: str, chunks: List[str], embeds: List[List[float]]) -> dict:
@@ -478,6 +605,89 @@ async def api_search(request: dict):
         raise
     except Exception as e:
         raise HTTPException(500, f"검색 오류: {str(e)}")
+
+@APP.post("/api/chat")
+async def api_rag_chat(request: dict):
+    """RAG 기반 스트리밍 채팅 API"""
+    try:
+        # question 또는 ragPrompt 둘 다 허용
+        question = request.get("question", request.get("ragPrompt", "")).strip()
+        if not question:
+            raise HTTPException(400, "질문을 입력해주세요")
+        
+        # 스트리밍 응답 생성기
+        def generate_rag_response():
+            try:
+                # 1) 관련 문서 검색 (임계값 낮춤)
+                relevant_chunks = search_relevant_chunks(question, top_k=5, threshold=0.1)
+                
+                if not relevant_chunks:
+                    # 관련 문서가 없을 때
+                    response_data = {
+                        "question": question,
+                        "answer": {
+                            "result": "죄송합니다. 관련된 문서를 찾을 수 없습니다. 다른 질문을 해보시겠어요?"
+                        }
+                    }
+                    yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                    return
+                
+                # 2) 컨텍스트 생성
+                context = create_context_from_chunks(relevant_chunks)
+                
+                # 3) 프롬프트 구성 (한국어 강제)
+                prompt = f"""당신은 한국어로 답변하는 도움이 되는 AI 어시스턴트입니다. 다음 문서들을 참고해서 질문에 정확하고 친절하게 한국어로 답변해주세요. 
+
+**참고 문서:**
+{context}
+
+**질문:** {question}
+
+**한국어 답변:** """
+
+                # 4) 스트리밍으로 답변 생성
+                full_answer = ""
+                for chunk_text in ollama_chat_stream(prompt):
+                    full_answer += chunk_text
+                    
+                    # 실시간으로 스트리밍 데이터 전송
+                    response_data = {
+                        "question": question,
+                        "answer": {
+                            "result": full_answer
+                        }
+                    }
+                    yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                
+                # 5) 완료 신호
+                yield f"data: [DONE]\n\n"
+                
+            except Exception as e:
+                error_response = {
+                    "question": question,
+                    "answer": {
+                        "result": f"죄송합니다. 답변을 생성하는 중 오류가 발생했습니다: {str(e)}"
+                    }
+                }
+                yield f"data: {json.dumps(error_response, ensure_ascii=False)}\n\n"
+                yield f"data: [DONE]\n\n"
+        
+        # Server-Sent Events 형태로 스트리밍 응답
+        return StreamingResponse(
+            generate_rag_response(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/plain; charset=utf-8",
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"RAG 채팅 오류: {str(e)}")
 
 # ===== 웹 페이지 (기존 유지) =====
 

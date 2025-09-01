@@ -306,16 +306,94 @@ def api_list_documents(limit: int = 50, offset: int = 0):
     except Exception as e:
         raise HTTPException(500, f"문서 목록 조회 오류: {str(e)}")
 
+@APP.post("/api/search-vectors")
+async def api_search_vectors(request: dict):
+    """Nextron용 벡터 데이터 제공 API"""
+    try:
+        query = request.get("query", "")
+        
+        if not query.strip():
+            raise HTTPException(400, "검색어를 입력해주세요")
+        
+        # 1) 질의 임베딩 생성
+        query_embedding = ollama_embed([query])[0]  # List[float]
+        
+        # 2) 모든 청크와 문서 정보 가져오기
+        import json
+        
+        chunks_data = supabase.table("chunks") \
+            .select("id, document_id, chunk_index, content, embedding") \
+            .execute()
+        
+        docs_data = supabase.table("documents") \
+            .select("id, title") \
+            .execute()
+        
+        # 문서 title 매핑
+        doc_titles = {doc["id"]: doc["title"] for doc in docs_data.data}
+        
+        # 청크 데이터 처리 (임베딩 파싱만)
+        processed_chunks = []
+        for chunk in chunks_data.data:
+            try:
+                # 문자열로 저장된 임베딩을 리스트로 변환
+                if isinstance(chunk["embedding"], str):
+                    embedding_str = chunk["embedding"].strip()
+                    if embedding_str.startswith('[') and embedding_str.endswith(']'):
+                        chunk_embedding = json.loads(embedding_str)
+                    else:
+                        chunk_embedding = [float(x.strip()) for x in embedding_str.split(',')]
+                else:
+                    chunk_embedding = chunk["embedding"]
+                
+                # 차원 검증
+                if len(chunk_embedding) != len(query_embedding):
+                    print(f"⚠️ 차원 불일치: query({len(query_embedding)}) vs chunk({len(chunk_embedding)})")
+                    continue
+                
+                processed_chunks.append({
+                    "id": chunk["id"],
+                    "content": chunk["content"],
+                    "embedding": chunk_embedding,  # 파싱된 벡터
+                    "document_id": chunk["document_id"],
+                    "document_title": doc_titles.get(chunk["document_id"], ""),
+                    "chunk_index": chunk["chunk_index"]
+                })
+                    
+            except Exception as parse_error:
+                print(f"청크 {chunk['id']} 파싱 실패: {parse_error}")
+                continue
+        
+        print(f"🔍 벡터 데이터 제공: '{query}' | 청크수={len(processed_chunks)} | 쿼리벡터차원={len(query_embedding)}")
+        
+        return JSONResponse({
+            "success": True,
+            "query": query,
+            "query_embedding": query_embedding,  # 질의 벡터
+            "chunks": processed_chunks,  # 모든 청크 데이터와 벡터
+            "count": len(processed_chunks)
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"벡터 데이터 조회 오류: {str(e)}")
+
 @APP.post("/api/search")  
 async def api_search(request: dict):
-    """벡터 유사도 검색 (Nextron용 핵심 기능)"""
+    """벡터 유사도 검색 (기존 방식 + 벡터 전용 옵션)"""
     try:
         query = request.get("query", "")
         top_k = request.get("top_k", 5)
         threshold = request.get("threshold", 0.5)
+        vectors_only = request.get("vectors_only", False)  # 새 옵션
         
         if not query.strip():
             raise HTTPException(400, "검색어를 입력해주세요")
+        
+        # vectors_only 모드면 새로운 API로 리다이렉트
+        if vectors_only:
+            return await api_search_vectors(request)
         
         # 1) 질의 임베딩 생성
         query_embedding = ollama_embed([query])[0]  # List[float]

@@ -314,13 +314,53 @@ FORM_HTML = """
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 720px; margin: 40px auto; padding: 0 16px; }
-    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; }
-    h1 { font-size: 20px; margin: 0 0 12px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+    h1, h2 { font-size: 20px; margin: 0 0 12px; }
+    h2 { font-size: 18px; margin: 24px 0 12px; }
+    h3 {margin: 0;}
     label { display:block; margin:12px 0 6px; font-weight:600; }
     input[type="text"], input[type="file"] { width:100%; padding:10px; border:1px solid #d1d5db; border-radius:8px; }
     button { margin-top:16px; padding:10px 16px; border-radius:10px; border:1px solid #111827; background:#111827; color:white; cursor:pointer; }
     .msg { margin-top:16px; white-space:pre-wrap; font-family:ui-monospace,Menlo,Consolas,monospace; }
     .hint { color:#6b7280; font-size:13px; }
+    
+    /* 테이블 스타일 */
+    .documents-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+    }
+    .documents-table th {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      padding: 12px 8px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .documents-table td {
+      border: 1px solid #e5e7eb;
+      padding: 12px 8px;
+      font-size: 13px;
+      vertical-align: top;
+    }
+    .documents-table tbody tr:hover {
+      background: #f9fafb;
+    }
+    
+    .file-info {
+      color: #6b7280;
+      font-size: 12px;
+    }
+    
+    .loading {
+      color: #6b7280;
+      font-style: italic;
+    }
+    
+    .error {
+      color: #dc2626;
+    }
   </style>
 </head>
 <body>
@@ -332,10 +372,109 @@ FORM_HTML = """
       <label>파일 선택</label>
       <input type="file" name="file" required />
       <div class="hint">PDF / DOCX / PPTX / TXT 지원</div>
-      <button type="submit">업로드 → 인덱싱 → DB 저장</button>
+      <button type="submit">DB 저장</button>
     </form>
-    <div class="msg">업로드 후 결과가 이 페이지로 표시됩니다.</div>
   </div>
+
+  <div class="card">
+    <h3>업로드된 문서 목록</h3>
+    <div id="documents-status" class="loading">문서 목록을 불러오는 중...</div>
+    
+    <table id="documents-table" class="documents-table" style="display: none;">
+      <thead>
+        <tr>
+          <th>제목</th>
+          <th>파일 정보</th>
+          <th>업로드 일시</th>
+        </tr>
+      </thead>
+      <tbody id="documents-tbody">
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    // 페이지 로드 시 문서 목록 불러오기
+    document.addEventListener('DOMContentLoaded', function() {
+      loadDocuments();
+    });
+
+    async function loadDocuments() {
+      try {
+        const response = await fetch('/api/documents');
+        const data = await response.json();
+        
+        const statusDiv = document.getElementById('documents-status');
+        const table = document.getElementById('documents-table');
+        const tbody = document.getElementById('documents-tbody');
+        
+        if (data.success && data.documents.length > 0) {
+          // 성공: 테이블 표시
+          statusDiv.style.display = 'none';
+          table.style.display = 'table';
+          
+          // 테이블 행 생성
+          tbody.innerHTML = '';
+          data.documents.forEach(doc => {
+            const row = tbody.insertRow();
+            
+            // 제목
+            const titleCell = row.insertCell();
+            titleCell.textContent = doc.title;
+            
+            // 파일 정보
+            const fileInfoCell = row.insertCell();
+            const fileSize = formatBytes(doc.bytes);
+            const fileName = doc.source_path;
+            fileInfoCell.innerHTML = `
+              <div>${fileName}</div>
+              <div class="file-info">${doc.mime_type} · ${fileSize}</div>
+            `;
+            
+            // 업로드 일시
+            const dateCell = row.insertCell();
+            const date = new Date(doc.created_at);
+            dateCell.textContent = formatDate(date);
+          });
+          
+        } else if (data.success && data.documents.length === 0) {
+          // 빈 결과
+          statusDiv.textContent = '업로드된 문서가 없습니다.';
+          statusDiv.className = '';
+        } else {
+          // API 오류
+          statusDiv.textContent = '문서 목록을 불러오는데 실패했습니다.';
+          statusDiv.className = 'error';
+        }
+        
+      } catch (error) {
+        console.error('문서 목록 로딩 오류:', error);
+        const statusDiv = document.getElementById('documents-status');
+        statusDiv.textContent = '문서 목록을 불러오는데 실패했습니다.';
+        statusDiv.className = 'error';
+      }
+    }
+    
+    // 바이트를 읽기 쉬운 형태로 변환
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+    
+    // 날짜 형식화
+    function formatDate(date) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      
+      return `${year}-${month}-${day} ${hours}:${minutes}`;
+    }
+  </script>
 </body>
 </html>
 """
